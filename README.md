@@ -16,6 +16,21 @@ Issues and starts are welcomed!
 
 tensorflow == 1.4.1
 
+## Model Architecture
+
+The model architecture is simple. Basiclly, you can think of it as a seq2seq model.
+
+![模型结构](img/model.png)
+
+Some details of the model:
+
+- Embedding layer + 3 * Bi-LSTM layers as encoder
+- Residual connection is added on the second and third Bi-LSTM layers
+- The final encoder outputs are weighted sum of outputs of each layer. Scalars and weight are learned variables. This idea is copied from ELMO.
+- Use a simple LSTM cell + Attention as decoder, decode 20 steps to get 20 outputs for each label
+    - Inputs to decoder are learnable embeddings
+- Outputs of decoder are fed to two FC layers to get the final sentiment logits
+
 ## Data preprocess
 
 The data preprocess code is not provided here, I may release it later.
