@@ -12,6 +12,10 @@ Testb rank: 16
 
 Issues and starts are welcomed!
 
+## Train from scratch
+
+For those who don't want to preprocess data, refer to [scripts](./scripts/readme.md).
+
 ## Data
 
 For those who want to get the raw dataset, please refer to this link [data](https://drive.google.com/file/d/1OInXRx_OmIJgK3ZdoFZnmqUi0rGfOaQo/view?usp=sharing).
