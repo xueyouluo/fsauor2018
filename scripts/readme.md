@@ -1,6 +1,6 @@
 ## Train Model from scratch with GPU
 
-This is a simple script used to run this code from scratch.
+This is a simple script used to run this code from scratch. Using the default settings, you can get macro f1 score 0.70769.
 
 > The data preprocess steps are no the same as the one I used during the competition, so the final f1 score may be not the same:
 
