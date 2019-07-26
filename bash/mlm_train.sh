@@ -1,0 +1,21 @@
+python main.py \
+--mode=train \
+--pretrain=True \
+--data_files /data/xueyou/data/corpus/datagrand/xlnet/text.txt \
+--vocab_file=/data/xueyou/data/corpus/datagrand/xlnet/vocab.txt \
+--embed_file=/data/xueyou/data/corpus/datagrand/w2v.512.txt \
+--max_len=128 \
+--embedding_size=512 \
+--num_units=512 \
+--num_layers=3 \
+--batch_size=128 \
+--steps_per_stats=100 \
+--steps_per_summary=100 \
+--encoder=elmo \
+--rnn_cell_name=lstm \
+--steps_per_save=5000 \
+--learning_rate=0.001 \
+--num_warmup_steps=5000 \
+--num_train_steps=100000 \
+--num_train_epoch=20 \
+--checkpoint_dir=/data/xueyou/data/corpus/datagrand/mlm/elmo_mlm

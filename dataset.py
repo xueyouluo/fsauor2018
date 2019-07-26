@@ -14,85 +14,69 @@ from utils import print_out
 from thrid_utils import read_vocab
 
 UNK_ID = 0
-SOS_ID = 1
-EOS_ID = 2
+PAD_ID = 1
 
 def _padding(tokens_list, max_len):
     ret = np.zeros((len(tokens_list),max_len),np.int32)
     for i,t in enumerate(tokens_list):
-        t = t + (max_len-len(t)) * [EOS_ID]
+        t = t + (max_len-len(t)) * [PAD_ID]
         ret[i] = t
     return ret
 
-def _tokenize(content, w2i, max_tokens=1200, reverse=False, split=True):
-    def get_tokens(content):
-        tokens = content.strip().split()
-        ids = []
-        for t in tokens:
-            if t in w2i:
-                ids.append(w2i[t])
-            else:
-                for c in t:
-                    ids.append(w2i.get(c,UNK_ID))
-        return ids
-    if split:
-        ids = get_tokens(content)
-    else:
-        ids = [w2i.get(t,UNK_ID) for t in content.strip().split()]
-    if reverse:
-        ids = list(reversed(ids))
-    tokens = [SOS_ID] + ids[:max_tokens] + [EOS_ID]
-    return tokens
+def convert_tokens_to_id(tokens, w2i, max_tokens=1200):
+    ids = [w2i.get(t,UNK_ID) for t in tokens]
+    if max_tokens != -1:
+        ids = ids[:max_tokens]
+    return ids
 
-class DataItem(namedtuple("DataItem",('content','length','labels','id'))):
+class DataItem(namedtuple("DataItem",('tokens','length','labels','raw_tokens'))):
     pass
 
 class DataSet(object):
-    def __init__(self, data_files, vocab_file, label_file, batch_size=32, reverse=False, split_word=True, max_len = 1200):
-        self.reverse = reverse
-        self.split_word = split_word
+    def __init__(self, data_files, vocab_file, label_file, batch_size=32, max_len = 1200, mode='train'):
         self.data_files = data_files
         self.batch_size = batch_size
         self.max_len = max_len
+        self.mode = mode
 
         self.vocab, self.w2i = read_vocab(vocab_file)
         self.i2w = {v:k for k,v in self.w2i.items()}
         self.label_names, self.l2i = read_vocab(label_file)
         self.i2l = {v:k for k,v in self.l2i.items()}
 
-        self.tag_l2i = {"1":0,"0":1,"-1":2,"-2":3}
-        self.tag_i2l = {v:k for k,v in self.tag_l2i.items()}
-
         self._raw_data = []
-        self.items = []
         self._preprocess()
 
-    def get_label(self, labels, l2i, normalize=False):
-        one_hot_labels = np.zeros(len(l2i),dtype=np.float32)
-        for n in labels:
-            if n:
-                one_hot_labels[l2i[n]] = 1
-        
-        if normalize:
-            one_hot_labels = one_hot_labels / len(labels)
-        return one_hot_labels
 
     def _preprocess(self):
         print_out("# Start to preprocessing data...")
         for fname in self.data_files:
-            print_out("# load data from %s ..." % fname)
-            for line in open(fname):
-                item = json.loads(line.strip())
-                content = item['content']
-                content = _tokenize(content, self.w2i, self.max_len, self.reverse, self.split_word)
-                item_labels = []
-                for label_name in self.label_names:
-                    labels = [item[label_name]]
-                    labels = self.get_label(labels,self.tag_l2i)
-                    item_labels.append(labels)
-                self._raw_data.append(DataItem(content=content,labels=np.asarray(item_labels),length=len(content),id=int(item['id'])))
-                self.items.append(item)
+          print_out("# load data from %s ..." % fname)
+          for i,line in enumerate(open(fname)):
+            if not line.strip():
+              continue
+            labels = ['O','O']
+            tokens = ['[CLS]','[SEP]']
+            if self.mode != 'inference':
+              segments = line.strip().split()
+              for segment in segments:
+                  seg_tokens,seg_label = segment.split('/')
+                  seg_tokens = seg_tokens.split('_')
+                  tokens.extend(seg_tokens)
+                  if seg_label == 'o':
+                    labels.extend(['O']*len(seg_tokens))
+                  else:
+                    seg_labels = ['I-{}'.format(seg_label)] * len(seg_tokens)
+                    seg_labels[0] = 'B-{}'.format(seg_label)
+                    labels.extend(seg_labels) 
+            else:
+              tokens.extend(line.strip().split('_'))
+              labels = ['O'] * len(tokens)
+            assert len(tokens) == len(labels), "tokens length not equal to label: {}".format(line)
+            tokens_id = convert_tokens_to_id(tokens, self.w2i, self.max_len)
+            labels = convert_tokens_to_id(labels,self.l2i,self.max_len)
 
+            self._raw_data.append(DataItem(raw_tokens=tokens,tokens=tokens_id,labels=labels,length=len(tokens)))
         self.num_batches = len(self._raw_data) // self.batch_size
         self.data_size = len(self._raw_data)
         print_out("# Got %d data items with %d batches" % (self.data_size, self.num_batches))
@@ -112,13 +96,12 @@ class DataSet(object):
         return iter(sort_idx)
 
     def process_batch(self, batch):
-        contents = [item.content for item in batch]
+        contents = [item.tokens for item in batch]
+        targets = [item.labels for item in batch]
         lengths = [item.length for item in batch]
         contents = _padding(contents,max(lengths))
-        lengths = np.asarray(lengths)
-        targets = np.asarray([item.labels for item in batch])
-        ids = [item.id for item in batch]
-        return contents, lengths, targets, ids
+        targets = _padding(targets,max(lengths))
+        return np.asarray(contents), np.asarray(lengths), np.asarray(targets)
 
     def get_next(self, shuffle=True):
         if shuffle:

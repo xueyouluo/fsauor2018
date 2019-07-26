@@ -8,12 +8,161 @@
 import codecs
 import csv
 import os
+import six
+import re
+import collections
 
 import numpy as np
 import tensorflow as tf
 
 # If a vocab size is greater than this value, put the embedding on cpu instead
 VOCAB_SIZE_THRESHOLD_CPU = 30000
+
+
+def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
+  """Compute the union of the current variables and checkpoint variables."""
+  assignment_map = {}
+  initialized_variable_names = {}
+
+  name_to_variable = collections.OrderedDict()
+  for var in tvars:
+    name = var.name
+    m = re.match("^(.*):\\d+$", name)
+    if m is not None:
+      name = m.group(1)
+    name_to_variable[name] = var
+
+  init_vars = tf.train.list_variables(init_checkpoint)
+
+  assignment_map = collections.OrderedDict()
+  for x in init_vars:
+    (name, var) = (x[0], x[1])
+    if name not in name_to_variable:
+      continue
+    # assignment_map[name] = name
+    assignment_map[name] = name_to_variable[name]
+    initialized_variable_names[name] = 1
+    initialized_variable_names[name + ":0"] = 1
+
+  return (assignment_map, initialized_variable_names)
+
+def init_from_checkpoint(init_checkpoint, tvars,hvd=None):
+  initialized_variable_names = {}
+  scaffold_fn = None
+  if init_checkpoint is not None and (hvd is None or hvd.rank() == 0):
+    if init_checkpoint.endswith("latest"):
+      ckpt_dir = os.path.dirname(init_checkpoint)
+      init_checkpoint = tf.train.latest_checkpoint(ckpt_dir)
+    elif not os.path.exists(init_checkpoint):
+      print("ckpt {0} not exists".format(init_checkpoint))
+      return scaffold_fn
+    else:
+      init_checkpoint = init_checkpoint
+
+    if not init_checkpoint:
+      print("Initialize ckpt is None")
+      return init_checkpoint
+    print("Initialize from the ckpt {}".format(init_checkpoint))
+
+    (assignment_map, initialized_variable_names
+    ) = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+
+    tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+
+    # Log customized initialization
+    print("**** Global Variables ****")
+    for var in tvars:
+      init_string = ""
+      if var.name in initialized_variable_names:
+        init_string = ", *INIT_FROM_CKPT*"
+      print("  %d :: name = %s, shape = %s%s"%( 0 if hvd is None else hvd.rank(), var.name, var.shape,
+                      init_string))
+    return init_checkpoint
+
+def assert_rank(tensor, expected_rank, name=None):
+  """Raises an exception if the tensor rank is not of the expected rank.
+
+  Args:
+    tensor: A tf.Tensor to check the rank of.
+    expected_rank: Python integer or list of integers, expected rank.
+    name: Optional name of the tensor for the error message.
+
+  Raises:
+    ValueError: If the expected shape doesn't match the actual shape.
+  """
+  if name is None:
+    name = tensor.name
+
+  expected_rank_dict = {}
+  if isinstance(expected_rank, six.integer_types):
+    expected_rank_dict[expected_rank] = True
+  else:
+    for x in expected_rank:
+      expected_rank_dict[x] = True
+
+  actual_rank = tensor.shape.ndims
+  if actual_rank not in expected_rank_dict:
+    scope_name = tf.get_variable_scope().name
+    raise ValueError(
+        "For the tensor `%s` in scope `%s`, the actual rank "
+        "`%d` (shape = %s) is not equal to the expected rank `%s`" %
+        (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
+
+def get_shape_list(tensor, expected_rank=None, name=None):
+  """Returns a list of the shape of tensor, preferring static dimensions.
+
+  Args:
+    tensor: A tf.Tensor object to find the shape of.
+    expected_rank: (optional) int. The expected rank of `tensor`. If this is
+      specified and the `tensor` has a different rank, and exception will be
+      thrown.
+    name: Optional name of the tensor for the error message.
+
+  Returns:
+    A list of dimensions of the shape of tensor. All static dimensions will
+    be returned as python integers, and dynamic dimensions will be returned
+    as tf.Tensor scalars.
+  """
+  if name is None:
+    name = tensor.name
+
+  if expected_rank is not None:
+    assert_rank(tensor, expected_rank, name)
+
+  shape = tensor.shape.as_list()
+
+  non_static_indexes = []
+  for (index, dim) in enumerate(shape):
+    if dim is None:
+      non_static_indexes.append(index)
+
+  if not non_static_indexes:
+    return shape
+
+  dyn_shape = tf.shape(tensor)
+  for index in non_static_indexes:
+    shape[index] = dyn_shape[index]
+  return shape
+  
+def gather_indexes(sequence_tensor, positions):
+  """Gathers the vectors at the specific positions over a minibatch."""
+  sequence_shape = get_shape_list(sequence_tensor, expected_rank=3)
+  batch_size = sequence_shape[0]
+  seq_length = sequence_shape[1]
+  width = sequence_shape[2]
+
+  flat_offsets = tf.reshape(
+      tf.range(0, batch_size, dtype=tf.int32) * seq_length, [-1, 1])
+  flat_positions = tf.reshape(positions + flat_offsets, [-1])
+  flat_sequence_tensor = tf.reshape(sequence_tensor,
+                                    [batch_size * seq_length, width])
+  output_tensor = tf.gather(flat_sequence_tensor, flat_positions)
+  return output_tensor
+
+def layer_norm(input_tensor, name=None):
+  """Run layer normalization on the last dimension of the tensor."""
+  return tf.contrib.layers.layer_norm(
+      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
 
 def read_vocab(vocab_file):
     """read vocab from file

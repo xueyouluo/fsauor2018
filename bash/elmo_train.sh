@@ -1,16 +1,27 @@
 python main.py \
 --mode=train \
---data_files scripts/data/train.json \
---eval_files=scripts/data/validation.json \
---label_file=scripts/data/labels.txt \
---vocab_file=scripts/data/vocab.txt \
---embed_file=scripts/data/embedding.txt \
+--data_files /data/xueyou/data/corpus/datagrand/test/train.txt \
+--eval_files=/data/xueyou/data/corpus/datagrand/test/eval.txt \
+--init_checkpoint=/data/xueyou/data/corpus/datagrand/mlm/elmo_mlm/latest \
+--label_file=labels.txt \
+--vocab_file=/data/xueyou/data/corpus/datagrand/xlnet/vocab.txt \
+--embed_file=/data/xueyou/data/corpus/datagrand/xlnet/embedding.65k.txt \
+--max_len=128 \
+--embedding_size=512 \
+--num_units=512 \
+--target_label_num=7 \
 --num_layers=3 \
 --batch_size=32 \
 --encoder=elmo \
 --rnn_cell_name=lstm \
---feature_num=20 \
---steps_per_eval=2000 \
---learning_rate=0.001 \
---focal_loss=0.0 \
---checkpoint_dir=scripts/data/elmo_ema_0120
+--steps_per_eval=1000 \
+--learning_rate=1e-4 \
+--num_warmup_steps=0 \
+--num_train_steps=25000 \
+--num_train_epoch=100 \
+--num_trainable_tokens=7 \
+--patient=5 \
+--ema=True \
+--add_transform=False \
+--init_transition_path=trans.npy \
+--checkpoint_dir=/data/xueyou/data/corpus/datagrand/test/elmo_mlm_compose
