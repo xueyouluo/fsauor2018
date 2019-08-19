@@ -7,10 +7,11 @@ import os
 
 import numpy as np
 import tensorflow as tf
+import bert_modeling
 
 from utils import (_reverse, focal_loss, gelu, get_total_param_num, print_out,
                    single_rnn_cell)
-from thrid_utils import create_embedding, gather_indexes, layer_norm
+from thrid_utils import create_embedding, gather_indexes, layer_norm, get_optimizer_class
 
 
 class Model(object):
@@ -398,12 +399,16 @@ class Model(object):
         clipped_gradients, _ = tf.clip_by_global_norm(
             gradients, self.hparams.max_gradient_norm)
         self.gradient_norm = tf.global_norm(gradients)
-        opt = tf.train.RMSPropOptimizer(self.learning_rate)
+        opt = get_optimizer_class(self.hparams.optimizer_class)(self.learning_rate)
         train_op = opt.apply_gradients(
             zip(clipped_gradients, params), global_step=self.global_step)
         if self.hparams.ema:
           with tf.control_dependencies([train_op]):
               train_op = self.ema.apply(params)
+
+        if self.hparams.optimizer_class == 'AdamWeightDecayOptimizer':
+          new_global_step = self.global_step + 1
+          train_op = tf.group(train_op, [self.global_step.assign(new_global_step)])
         self.train_op = train_op
 
     def train_clf_one_step(self, sess, source, lengths, targets, add_summary=False, run_info=False):
@@ -457,6 +462,150 @@ class Model(object):
         predict = sess.run(
             self.final_predict, feed_dict=feed_dict)
         return predict
+
+
+class BertModel(Model):
+  def __init__(self, hparams):
+        self.hparams = hparams
+        self.bert_config = bert_modeling.BertConfig.from_json_file(hparams.bert_config_file)
+
+  def setup_input_placeholders(self):
+    self.input_ids = tf.placeholder(
+        tf.int32, shape=[None, None], name='input_ids')
+    self.input_mask = tf.placeholder(tf.int32,shape=[None,None],name='input_mask')
+    self.batch_size = tf.shape(self.input_ids, out_type=tf.int32)[0]
+    self.sequence_length = tf.reduce_sum(self.input_mask,axis=-1)
+    self.token_num = tf.reduce_sum(self.sequence_length)
+    self.segment_ids = tf.placeholder(tf.int32,shape=[None,None],name='segment_ids')
+
+    # for training and evaluation
+    if self.hparams.mode in ['train', 'eval']:
+        self.target_labels = tf.placeholder(
+            tf.int32, shape=[None, None], name='target_labels')
+
+    self.global_step = tf.Variable(
+        initial_value=0,
+        name="global_step",
+        trainable=False,
+        collections=[tf.GraphKeys.GLOBAL_STEP, tf.GraphKeys.GLOBAL_VARIABLES])
+    
+    self.embedding_dropout = tf.Variable(
+        self.hparams.embedding_dropout, trainable=False)
+    self.dropout_keep_prob = tf.Variable(
+        self.hparams.dropout_keep_prob, trainable=False)
+  
+  def build(self):
+    self.setup_input_placeholders()
+    self.bert_encoder()
+    self.setup_clf()
+
+    self.params = tf.trainable_variables()
+    if self.hparams.ema:
+      self.ema = tf.train.ExponentialMovingAverage(decay=0.9999)
+
+    if self.hparams.mode in ['train', 'eval']:
+        self.setup_loss()
+    if self.hparams.mode == 'train':
+        self.setup_training()
+        self.setup_summary()
+    self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=10)
+
+  def bert_encoder(self):
+    model = bert_modeling.BertModel(
+      config=self.bert_config,
+      is_training=self.is_training(),
+      input_ids=self.input_ids,
+      input_mask=self.input_mask,
+      token_type_ids=self.segment_ids,
+      embedding_dropout=self.embedding_dropout
+    )
+
+    self.sequence_output = model.get_sequence_output()
+    self.get_pooled_output = model.get_pooled_output()
+
+  def setup_clf(self):
+    logits = self.sequence_output
+    if self.is_training():
+      logits = tf.nn.dropout(logits, keep_prob=self.dropout_keep_prob)
+    if self.hparams.add_transform:
+      # We apply one more non-linear transformation before the output layer.
+      # This matrix is not used after pre-training.
+      with tf.variable_scope("transform"):
+        logits = tf.layers.dense(
+            logits,
+            units=self.hparams.num_units,
+            activation=tf.nn.relu,
+            kernel_initializer=tf.truncated_normal_initializer(stddev=0.02))
+        logits = bert_modeling.layer_norm(logits)
+    with tf.variable_scope("ner", reuse=tf.AUTO_REUSE) as scope:
+        logits = tf.layers.dense(logits,self.hparams.target_label_num)
+        with tf.variable_scope("crf"):
+            # setup crf layer
+            trans = tf.get_variable(
+                "transitions",
+                shape=[self.hparams.target_label_num,
+                        self.hparams.target_label_num],
+                initializer=tf.contrib.layers.xavier_initializer())
+            if self.hparams.init_transition_path:
+              print("Load init transition weight")
+              init_transition_params = np.load(self.hparams.init_transition_path)
+              mask = np.isinf(init_transition_params)
+              trans = tf.where(mask, x=init_transition_params, y=trans)
+
+            pred_ids, _ = tf.contrib.crf.crf_decode(
+                potentials=logits, transition_params=trans, sequence_length=self.sequence_length)
+            if self.hparams.mode != 'inference':
+                self.log_likelihood, trans = tf.contrib.crf.crf_log_likelihood(
+                    inputs=logits,
+                    tag_indices=self.target_labels,
+                    transition_params=trans,
+                    sequence_lengths=self.sequence_length)
+
+        self.final_predict = pred_ids
+        if self.hparams.mode in ['train', 'eval']:
+          mask = tf.to_int32(tf.not_equal(self.target_labels,0))
+          acc = mask * tf.to_int32(tf.equal(self.final_predict,self.target_labels))
+          self.accurary = tf.reduce_sum(acc) / tf.reduce_sum(mask)
+          # self.accurary = tf.contrib.metrics.accuracy(tf.to_int32(
+          #   self.final_predict), tf.to_int32(self.target_labels))
+
+  def train_clf_one_step(self, sess, features, add_summary=False):
+    feed_dict = {}
+    feed_dict[self.input_ids] = features['input_ids']
+    feed_dict[self.input_mask] = features["input_mask"]
+    feed_dict[self.segment_ids] = features["segment_ids"]
+    feed_dict[self.target_labels] = features["target_labels"]
+
+    _, batch_loss, summary, global_step, accuracy, token_num, batch_size = sess.run(
+        [self.train_op, self.losses, self.summary_op, self.global_step, self.accurary, self.token_num, self.batch_size],
+        feed_dict=feed_dict
+    )
+    if add_summary:
+        self.summary_writer.add_summary(summary, global_step=global_step)
+    return batch_loss, global_step, accuracy,token_num, batch_size
+
+  def eval_clf_one_step(self, sess, features):
+    feed_dict = {}
+    feed_dict[self.input_ids] = features['input_ids']
+    feed_dict[self.input_mask] = features["input_mask"]
+    feed_dict[self.segment_ids] = features["segment_ids"]
+    feed_dict[self.target_labels] = features["target_labels"]
+
+    batch_loss, accuracy, batch_size, predict = sess.run(
+        [self.losses, self.accurary, self.batch_size, self.final_predict],
+        feed_dict=feed_dict
+    )
+    return batch_loss, accuracy, batch_size, predict
+
+  def inference_clf_one_batch(self, sess, features):
+    feed_dict = {}
+    feed_dict[self.input_ids] = features['input_ids']
+    feed_dict[self.input_mask] = features["input_mask"]
+    feed_dict[self.segment_ids] = features["segment_ids"]
+
+    predict = sess.run(
+        self.final_predict, feed_dict=feed_dict)
+    return predict
 
 class MLMModel(Model):
   def setup_input_placeholders(self):

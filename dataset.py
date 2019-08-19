@@ -13,8 +13,8 @@ import tensorflow as tf
 from utils import print_out
 from thrid_utils import read_vocab
 
-UNK_ID = 0
-PAD_ID = 1
+UNK_ID = 1
+PAD_ID = 0
 
 def _padding(tokens_list, max_len):
     ret = np.zeros((len(tokens_list),max_len),np.int32)
@@ -55,8 +55,8 @@ class DataSet(object):
           for i,line in enumerate(open(fname)):
             if not line.strip():
               continue
-            labels = ['O','O']
-            tokens = ['[CLS]','[SEP]']
+            labels = []
+            tokens = []
             if self.mode != 'inference':
               segments = line.strip().split()
               for segment in segments:
@@ -76,7 +76,7 @@ class DataSet(object):
             tokens_id = convert_tokens_to_id(tokens, self.w2i, self.max_len)
             labels = convert_tokens_to_id(labels,self.l2i,self.max_len)
 
-            self._raw_data.append(DataItem(raw_tokens=tokens,tokens=tokens_id,labels=labels,length=len(tokens)))
+            self._raw_data.append(DataItem(raw_tokens=tokens,tokens=tokens_id,labels=labels,length=len(tokens_id)))
         self.num_batches = len(self._raw_data) // self.batch_size
         self.data_size = len(self._raw_data)
         print_out("# Got %d data items with %d batches" % (self.data_size, self.num_batches))
@@ -97,12 +97,22 @@ class DataSet(object):
 
     def process_batch(self, batch):
         contents = [item.tokens for item in batch]
+        segments = [[0]*len(c) for c in contents]
+        input_mask = [[1]*len(c) for c in contents]
         targets = [item.labels for item in batch]
         lengths = [item.length for item in batch]
+        assert all([l <= self.max_len for l in lengths])
         contents = _padding(contents,max(lengths))
+        segments = _padding(segments,max(lengths))
+        input_mask = _padding(input_mask,max(lengths))
         targets = _padding(targets,max(lengths))
-        return np.asarray(contents), np.asarray(lengths), np.asarray(targets)
-
+        return {
+          "input_ids":np.asarray(contents),
+          "input_mask":np.asarray(input_mask),
+          "segment_ids":np.asarray(segments),
+          "target_labels":np.asarray(targets)
+          }
+        
     def get_next(self, shuffle=True):
         if shuffle:
             idxs = self._shuffle()

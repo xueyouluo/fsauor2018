@@ -15,9 +15,125 @@ import collections
 import numpy as np
 import tensorflow as tf
 
+from utils import print_out
+
 # If a vocab size is greater than this value, put the embedding on cpu instead
 VOCAB_SIZE_THRESHOLD_CPU = 30000
 
+class AdamWeightDecayOptimizer(tf.train.Optimizer):
+  """A basic Adam optimizer that includes "correct" L2 weight decay."""
+
+  def __init__(self,
+               learning_rate,
+               weight_decay_rate=0.01,
+               beta_1=0.9,
+               beta_2=0.999,
+               epsilon=1e-6,
+               exclude_from_weight_decay=None,
+               name="AdamWeightDecayOptimizer"):
+    """Constructs a AdamWeightDecayOptimizer."""
+    super(AdamWeightDecayOptimizer, self).__init__(False, name)
+
+    self.learning_rate = learning_rate
+    self.weight_decay_rate = weight_decay_rate
+    self.beta_1 = beta_1
+    self.beta_2 = beta_2
+    self.epsilon = epsilon
+    self.exclude_from_weight_decay = exclude_from_weight_decay
+
+  def apply_gradients(self, grads_and_vars, global_step=None, name=None):
+    """See base class."""
+    assignments = []
+    for (grad, param) in grads_and_vars:
+      if grad is None or param is None:
+        continue
+
+      param_name = self._get_variable_name(param.name)
+
+      m = tf.get_variable(
+          name=param_name + "/adam_m",
+          shape=param.shape.as_list(),
+          dtype=tf.float32,
+          trainable=False,
+          initializer=tf.zeros_initializer())
+      v = tf.get_variable(
+          name=param_name + "/adam_v",
+          shape=param.shape.as_list(),
+          dtype=tf.float32,
+          trainable=False,
+          initializer=tf.zeros_initializer())
+
+      # Standard Adam update.
+      next_m = (
+          tf.multiply(self.beta_1, m) + tf.multiply(1.0 - self.beta_1, grad))
+      next_v = (
+          tf.multiply(self.beta_2, v) + tf.multiply(1.0 - self.beta_2,
+                                                    tf.square(grad)))
+
+      update = next_m / (tf.sqrt(next_v) + self.epsilon)
+
+      # Just adding the square of the weights to the loss function is *not*
+      # the correct way of using L2 regularization/weight decay with Adam,
+      # since that will interact with the m and v parameters in strange ways.
+      #
+      # Instead we want ot decay the weights in a manner that doesn't interact
+      # with the m/v parameters. This is equivalent to adding the square
+      # of the weights to the loss with plain (non-momentum) SGD.
+      if self._do_use_weight_decay(param_name):
+        update += self.weight_decay_rate * param
+
+      update_with_lr = self.learning_rate * update
+
+      next_param = param - update_with_lr
+
+      assignments.extend(
+          [param.assign(next_param),
+           m.assign(next_m),
+           v.assign(next_v)])
+    return tf.group(*assignments, name=name)
+
+  def _do_use_weight_decay(self, param_name):
+    """Whether to use L2 weight decay for `param_name`."""
+    if not self.weight_decay_rate:
+      return False
+    if self.exclude_from_weight_decay:
+      for r in self.exclude_from_weight_decay:
+        if re.search(r, param_name) is not None:
+          return False
+    return True
+
+  def _get_variable_name(self, param_name):
+    """Get the variable name from the tensor name."""
+    m = re.match("^(.*):\\d+$", param_name)
+    if m is not None:
+      param_name = m.group(1)
+    return param_name
+
+def get_optimizer_class(classname):
+  """Returns the optimizer class.
+
+  Args:
+    classname: The name of the optimizer class in ``tf.train``,
+      ``tf.contrib.opt``, or ``opennmt.optimizers`` as a string.
+
+  Returns:
+    A class inheriting from ``tf.train.Optimizer``.
+
+  Raises:
+    ValueError: if :obj:`classname` can not be resolved.
+  """
+  optimizer_class = None
+
+  if optimizer_class is None:
+    optimizer_class = getattr(tf.train, classname, None)
+  if optimizer_class is None:
+    optimizer_class = getattr(tf.contrib.opt, classname, None)
+  if optimizer_class is None and classname == 'AdamWeightDecayOptimizer':
+    optimizer_class = AdamWeightDecayOptimizer
+  if optimizer_class is None:
+    raise ValueError("Unknown optimizer class: {}".format(classname))
+
+  return optimizer_class
 
 def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
   """Compute the union of the current variables and checkpoint variables."""
@@ -50,19 +166,17 @@ def init_from_checkpoint(init_checkpoint, tvars,hvd=None):
   initialized_variable_names = {}
   scaffold_fn = None
   if init_checkpoint is not None and (hvd is None or hvd.rank() == 0):
+    print_out("start to load")
     if init_checkpoint.endswith("latest"):
       ckpt_dir = os.path.dirname(init_checkpoint)
       init_checkpoint = tf.train.latest_checkpoint(ckpt_dir)
-    elif not os.path.exists(init_checkpoint):
-      print("ckpt {0} not exists".format(init_checkpoint))
-      return scaffold_fn
     else:
       init_checkpoint = init_checkpoint
 
     if not init_checkpoint:
-      print("Initialize ckpt is None")
+      print_out("Initialize ckpt is None")
       return init_checkpoint
-    print("Initialize from the ckpt {}".format(init_checkpoint))
+    print_out("Initialize from the ckpt {}".format(init_checkpoint))
 
     (assignment_map, initialized_variable_names
     ) = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
@@ -70,14 +184,16 @@ def init_from_checkpoint(init_checkpoint, tvars,hvd=None):
     tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
     # Log customized initialization
-    print("**** Global Variables ****")
+    print_out("**** Global Variables ****")
     for var in tvars:
       init_string = ""
       if var.name in initialized_variable_names:
         init_string = ", *INIT_FROM_CKPT*"
-      print("  %d :: name = %s, shape = %s%s"%( 0 if hvd is None else hvd.rank(), var.name, var.shape,
+      print_out("  %d :: name = %s, shape = %s%s"%( 0 if hvd is None else hvd.rank(), var.name, var.shape,
                       init_string))
     return init_checkpoint
+  else:
+    print_out("Nothing to init")
 
 def assert_rank(tensor, expected_rank, name=None):
   """Raises an exception if the tensor rank is not of the expected rank.

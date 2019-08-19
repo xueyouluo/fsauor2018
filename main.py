@@ -12,7 +12,7 @@ import numpy as np
 import tensorflow as tf
 
 from dataset import DataSet
-from model import Model,MLMModel
+from model import Model,MLMModel,BertModel
 from utils import *
 from conlleval import return_report
 from create_pretraining_data import PretrainDataset
@@ -39,6 +39,7 @@ def add_arguments(parser):
     parser.add_argument("--prob", type='bool', nargs="?", const=True, default=False, help="Whether to export prob")
 
     # model
+    parser.add_argument("--bert_config_file", type=str, default=None, help="bert_config_file")
     parser.add_argument("--add_transform", type='bool', nargs="?", const=True, default=False, help="Whether to add transform layer")
     parser.add_argument("--num_layers", type=int, default=2, help="number of layers")
     parser.add_argument("--init_transition_path", type=str, default=None, help = 'init_transition_path')
@@ -64,6 +65,7 @@ def add_arguments(parser):
     parser.add_argument("--target_label_num", type=int, default=4, help="target_label_num")
 
     # train
+    parser.add_argument("--optimizer_class", type=str, default="AdamWeightDecayOptimizer", help="optimizer_class")
     parser.add_argument("--need_early_stop", type='bool', nargs="?", const=True, default=True, help="Whether to early stop")
     parser.add_argument("--patient", type=int, default=5, help="patient of early stop")
     parser.add_argument("--debug", type='bool', nargs="?", const=True, default=False, help="Whether use debug mode")
@@ -170,8 +172,8 @@ def train_eval_clf(model, sess, dataset):
     checkpoint_loss, acc = 0.0, 0.0
 
     predicts = []
-    for i,(source, lengths, targets) in enumerate(dataset.get_next(shuffle=False)):
-        batch_loss, accuracy, batch_size, predict = model.eval_clf_one_step(sess, source, lengths, targets)
+    for i,features in enumerate(dataset.get_next(shuffle=False)):
+        batch_loss, accuracy, batch_size, predict = model.eval_clf_one_step(sess, features)
         predicts.extend(predict)
         checkpoint_loss += batch_loss
         acc += accuracy
@@ -261,17 +263,16 @@ def train_clf(flags):
     save_hparams(flags.checkpoint_dir, hparams)
     print(hparams)
 
-    train_graph = tf.Graph()
     eval_graph = tf.Graph()
 
     # with train_graph.as_default():
-    train_model = Model(hparams)
+    train_model = BertModel(hparams)
     train_model.build()
     tvars = tf.trainable_variables()
 
     with eval_graph.as_default():
         eval_hparams = load_hparams(flags.checkpoint_dir,{"mode":'eval','checkpoint_dir':flags.checkpoint_dir+"/best_eval"})
-        eval_model = Model(eval_hparams)
+        eval_model = BertModel(eval_hparams)
         eval_model.build()
 
     train_sess = tf.Session(config=get_config_proto(log_device_placement=False))
@@ -300,10 +301,10 @@ def train_clf(flags):
     final_learn = 3
     for epoch in range(flags.num_train_epoch):
         step_time, checkpoint_loss, acc, iters = 0.0, 0.0, 0.0, 0
-        for i,(source, lengths, targets) in enumerate(dataset.get_next()):
+        for i,features in enumerate(dataset.get_next()):
             start_time = time.time()
             add_summary = (global_step % flags.steps_per_summary == 0)
-            batch_loss, global_step, accuracy, token_num,_ = train_model.train_clf_one_step(train_sess,source, lengths, targets, add_summary = add_summary, run_info= add_summary and flags.debug) 
+            batch_loss, global_step, accuracy, token_num,_ = train_model.train_clf_one_step(train_sess,features, add_summary = add_summary) 
             step_time += (time.time() - start_time)
             checkpoint_loss += batch_loss
             acc += accuracy
@@ -315,7 +316,7 @@ def train_clf(flags):
             if global_step % flags.steps_per_stats == 0:
                 train_acc = (acc / flags.steps_per_stats) * 100
                 acc_summary = tf.Summary()
-                acc_summary.value.add(tag='accuracy', simple_value = train_acc)
+                acc_summary.value.add(tag='mean_accuracy', simple_value = train_acc)
                 train_model.summary_writer.add_summary(acc_summary, global_step=global_step)
 
                 print_out(
@@ -324,6 +325,11 @@ def train_clf(flags):
                     (epoch+1, global_step, checkpoint_loss/flags.steps_per_stats, i+1,dataset.num_batches, train_model.learning_rate.eval(session=train_sess),
                     train_acc, (iters)/step_time, step_time/(flags.steps_per_stats)))
                 step_time, checkpoint_loss, iters, acc = 0.0, 0.0, 0, 0.0
+
+            if global_step >= flags.num_train_steps:
+              train_model.save_model(train_sess)
+              print_out("# Reach training steps, stop ...")
+              exit(0)
 
             if global_step % flags.steps_per_eval == 0:
                 print_out("# global step {0}, eval model at {1}".format(global_step, time.ctime()))
@@ -355,10 +361,13 @@ def train_clf(flags):
                           lr = tf.assign(train_model.learning_rate, current_lr/5)
                           train_sess.run(lr)
                         if final_learn==1:
-                            train_model.saver.restore(train_sess, pre_best_checkpoint)
-                            dropout = tf.assign(train_model.dropout_keep_prob, 1.0)
-                            emd_drop = tf.assign(train_model.embedding_dropout, 0.0)
-                            train_sess.run([dropout,emd_drop])
+                          train_model.saver.restore(train_sess, pre_best_checkpoint)
+                          dropout = tf.assign(train_model.dropout_keep_prob, 1.0)
+                          emd_drop = tf.assign(train_model.embedding_dropout, 0.0)
+                          train_sess.run([dropout,emd_drop])
+                        if flags.num_warmup_steps > 0:
+                          new_global_step = tf.assign(train_model.global_step, global_step)
+                          train_sess.run(new_global_step)
                         eval_ppls = [best_eval]
                         continue
 
